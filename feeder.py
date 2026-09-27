@@ -1,20 +1,40 @@
 import time
+import os
+import argparse
 import requests
 import pymysql
-import json
 import re
 
-# ── 1. HARD-CODED DATABASE CONFIGURATION ──
-DB_HOST = "YOUR_GOOGIEHOST_DATABASE_IP" 
-DB_NAME = "quarterflowai_db"
-DB_USER = "root"
-DB_PASS = "YOUR_PASSWORD"
-DB_PORT = 3306
-
 def get_db_connection():
+    settings = {
+        "host": os.environ.get("DB_HOST"),
+        "database": os.environ.get("DB_NAME"),
+        "user": os.environ.get("DB_USER"),
+        "password": os.environ.get("DB_PASSWORD"),
+    }
+    env_names = {
+        "host": "DB_HOST",
+        "database": "DB_NAME",
+        "user": "DB_USER",
+        "password": "DB_PASSWORD",
+    }
+    missing = [env_names[name] for name, value in settings.items() if not value]
+    if missing:
+        raise RuntimeError("Missing required database environment settings: " + ", ".join(missing))
+
+    try:
+        port = int(os.environ.get("DB_PORT", "3306"))
+    except ValueError as error:
+        raise RuntimeError("DB_PORT must be a valid integer.") from error
+
     return pymysql.connect(
-        host=DB_HOST, user=DB_USER, password=DB_PASS, 
-        database=DB_NAME, port=DB_PORT, autocommit=True,
+        host=settings["host"],
+        user=settings["user"],
+        password=settings["password"],
+        database=settings["database"],
+        port=port,
+        connect_timeout=5,
+        autocommit=True,
         cursorclass=pymysql.cursors.DictCursor
     )
 
@@ -25,7 +45,7 @@ def purge_expired_database_logs(connection):
         with connection.cursor() as cursor:
             cursor.execute("DELETE FROM live_telemetry WHERE match_id IN (SELECT id FROM matches WHERE status = 'completed')")
             cursor.execute("DELETE FROM matches WHERE status = 'completed'")
-            cursor.execute("DELETE FROM prediction_logs WHERE evaluated_at < NOW() - INTERVAL 2 DAY")
+            cursor.execute("DELETE FROM prediction_logs WHERE logged_at < NOW() - INTERVAL 2 DAY")
             print("🧹 Storage Retention Sweep executed. Database size strictly protected.")
     except Exception as e:
         print(f"⚠️ Cleanup failure: {e}")
@@ -50,6 +70,16 @@ def parse_1xbet_feed(headers):
     except Exception as e:
         print(f"1xBet node skip: {e}")
     return matches
+
+def classify_league_tier(league_name):
+    normalized = str(league_name or "").lower()
+    if any(term in normalized for term in ("ncaa", "college", "university")):
+        return "collegiate"
+    if "youth" in normalized or "academy" in normalized:
+        return "youth_academy"
+    if "cup" in normalized or "regional" in normalized:
+        return "regional_cup"
+    return "professional"
 
 # ── 4. PROVIDER 2: SOFASCORE DIRECT STREAM ──
 def parse_sofascore_feed(headers):
@@ -136,8 +166,16 @@ def run_master_feeder_pipeline():
                 cursor.execute("""
                     INSERT INTO matches (id, sport_type, league_tier, team_a_name, team_b_name, current_segment, status)
                     VALUES (%s, 'basketball', %s, %s, %s, %s, 'live')
-                    ON DUPLICATE KEY UPDATE current_segment = VALUES(current_segment)
-                """, (m["match_id"], m["league"], m["team_a"], m["team_b"], m["current_segment"]))
+                    ON DUPLICATE KEY UPDATE
+                        league_tier = VALUES(league_tier),
+                        team_a_name = VALUES(team_a_name),
+                        team_b_name = VALUES(team_b_name),
+                        current_segment = VALUES(current_segment),
+                        status = 'live'
+                """, (
+                    m["match_id"], classify_league_tier(m.get("league")),
+                    m["team_a"], m["team_b"], m["current_segment"]
+                ))
 
                 cursor.execute("""
                     INSERT INTO live_telemetry (match_id, segment_index, elapsed_seconds, score_a, score_b)
@@ -150,6 +188,13 @@ def run_master_feeder_pipeline():
         print(f"🚨 Database Handshake Error: {db_err}")
 
 if __name__ == "__main__":
-    while True:
+    parser = argparse.ArgumentParser(description="Fetch and persist one live basketball feed update.")
+    parser.add_argument("--loop", action="store_true", help="Keep polling every 30 seconds.")
+    args = parser.parse_args()
+
+    if args.loop:
+        while True:
+            run_master_feeder_pipeline()
+            time.sleep(30)
+    else:
         run_master_feeder_pipeline()
-        time.sleep(30) # Continuous 30s sportsbook update loop cycles
