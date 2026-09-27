@@ -1,0 +1,25 @@
+name: QuarterFlowAI Live Data Feeder
+on:
+  schedule:
+    - cron: '*/5 * * * *' # Automated cloud cron trigger: runs every 5 minutes completely free
+  workflow_dispatch:
+
+jobs:
+  run-feeder:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v4
+
+      - name: Initialize Python Core
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Download Dependency Matrices
+        run: pip install requests pymysql
+
+      - name: Fire Feeder Pipeline Strike
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: python feeder.py
